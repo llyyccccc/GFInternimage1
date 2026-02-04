@@ -3,21 +3,8 @@ from torch import nn
 from timm.models.layers import DropPath
 import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
-# from .MEEM import EdgeEnhancer
-from .FADC import FrequencySelection
-from .APCconv import PConv
-# from .FourierUnit import FourierUnit
-from .DSConv_pro import DSConv_pro
-from .EMCAD import SAB
-from .FEM import FEM
-from .WTConv import WTConv2d
-import numpy as np
-from .TVConv import TVConv
-from .LWN import LWN
-from .TripletAttention import TripletAttention,ChannelPool
-from .odconv import ODConv2d
-from .CBAM import CBAM
-from .FADC import AdaptiveDilatedConv
+
+
 
 
 class simam_module(torch.nn.Module):
@@ -37,48 +24,7 @@ class simam_module(torch.nn.Module):
 
         return x * self.activaton(y)
 
-class FeatureRefinementModule(nn.Module):
-    def __init__(self, in_dim=128, out_dim=128, down_kernel=5, down_stride=4):
-        super().__init__()
 
-        
-        self.lconv = nn.Conv2d(in_dim, in_dim, kernel_size=3, stride=1, padding=1, groups=in_dim)
-        self.hconv = nn.Conv2d(in_dim, in_dim, kernel_size=3, stride=1, padding=1, groups=in_dim)
-        self.norm1 = LayerNorm(in_dim, eps=1e-6, data_format="channels_first")  
-        self.norm2 = LayerNorm(in_dim, eps=1e-6, data_format="channels_first")  
-        self.act = nn.GELU()  
-       
-        
-        self.down = nn.Conv2d(in_dim, in_dim, kernel_size=down_kernel, stride=down_stride, padding=down_kernel // 2,
-                              groups=in_dim)
-        self.proj = nn.Conv2d(in_dim * 2, out_dim, kernel_size=1, stride=1, padding=0)  
-
-        self.apply(self._init_weights)  
-
-    def _init_weights(self, m):
-       
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            trunc_normal_(m.weight, std=.02)  
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)  
-
-        elif isinstance(m, (LayerNorm, nn.LayerNorm)):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-       
-        dx = self.down(x)  
-        
-        udx = F.interpolate(dx, size=(H, W), mode='bilinear', align_corners=False) 
-        
-        lx = self.norm1(self.lconv(self.act(x * udx)))  
-        hx = self.norm2(self.hconv(self.act(x - udx)))  
-
-        out = self.act(self.proj(torch.cat([lx, hx], dim=1)))  
-
-        return out
 
 class EncoderConv(nn.Module):
     def __init__(self, in_ch, out_ch):
@@ -117,57 +63,109 @@ class LayerNorm(nn.Module):
 
 
 
-class ConvBN(torch.nn.Sequential):
-    def __init__(self, in_planes, out_planes, kernel_size=1, stride=1, padding=0, dilation=1, groups=1, with_bn=True):
-        super().__init__()
-        self.add_module('conv', torch.nn.Conv2d(in_planes, out_planes, kernel_size, stride, padding, dilation, groups))
-        if with_bn:
-            self.add_module('bn', torch.nn.BatchNorm2d(out_planes))
-            torch.nn.init.constant_(self.bn.weight, 1)
-            torch.nn.init.constant_(self.bn.bias, 0)
 
 
-class Block(nn.Module):
-    def __init__(self, dim, mlp_ratio=3, drop_path=0.):
+class oneConv(nn.Module):
+    # 卷积+ReLU函数
+    def __init__(self, in_channels, out_channels, kernel_sizes, paddings, dilations):
         super().__init__()
-        self.dwconv = ConvBN(dim, dim, 5, 1, (5 - 1) // 2, groups=dim, with_bn=True)
-        self.f1 = ConvBN(dim, mlp_ratio * dim, 1, with_bn=False)
-        self.f2 = ConvBN(dim, mlp_ratio * dim, 1, with_bn=False)
-        self.g = ConvBN(mlp_ratio * dim, dim, 1, with_bn=True)
-        self.dwconv2 = ConvBN(dim, dim, 5, 1, (5 - 1) // 2, groups=dim, with_bn=False)
-        self.act = nn.ReLU6()
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_sizes, padding=paddings, dilation=dilations,
+                      bias=False),  ###, bias=False
+            # nn.BatchNorm2d(out_channels),
+            # nn.ReLU(inplace=True),
+        )
 
     def forward(self, x):
-        input = x
-        x = self.dwconv(x)
-        x1, x2 = self.f1(x), self.f2(x)
-        x = self.act(x1) * x2
-        x = self.dwconv2(self.g(x))
-        x = input + self.drop_path(x)
+        x = self.conv(x)
         return x
 
-class SpatialAttentionModule(nn.Module):
-    def __init__(self):
-        super(SpatialAttentionModule, self).__init__()
-        self.conv2d = nn.Conv2d(in_channels=2, out_channels=1, kernel_size=7, stride=1, padding=3)
-        self.sigmoid = nn.Sigmoid()
+
+class ImprovedLKS(nn.Module):
+    def __init__(self, dim, H, W, s_kernel_size=3):
+        super().__init__()
+
+        # 多尺度上下文模块（空洞卷积金字塔）→ 4个不同膨胀率的卷积
+        self.dilated_convs = nn.ModuleList([
+            nn.Conv2d(dim, dim, 3, padding=d, dilation=d, groups=dim // 4)
+            for d in [1, 2, 3, 5]  # 保持4个尺度
+        ])
+
+        # 通道-空间注意力（保持原设计）
+        self.channel_att = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim, dim // 4, 1),
+            nn.GELU(),
+            nn.Conv2d(dim // 4, dim, 1),
+            nn.Sigmoid()
+        )
+
+        # 动态融合权重→ 调整为4个权重参数
+        self.fusion_weights = nn.Parameter(torch.ones(4))  # 关键修改点
+
+        # 锐化模块（保持原设计）
+        self.h_ctx = nn.Sequential(
+            nn.Conv2d(dim, dim, 5, padding=2, groups=dim),
+            nn.GELU(),
+            DepthWiseSeparableConv(dim, dim, 3)
+        )
+
+        # 添加缺失的动态投影层
+        self.dynamic_proj = nn.Sequential(
+            nn.Conv2d(dim * 2, dim, 1),
+            LayerNorm(dim, eps=1e-6, data_format="channels_first"),
+            nn.GELU()
+        )
+
+        # 残差连接
+        self.shortcut = nn.Conv2d(dim, dim, 1)
 
     def forward(self, x):
-        avgout = torch.mean(x, dim=1, keepdim=True)
-        maxout, _ = torch.max(x, dim=1, keepdim=True)
-        out = torch.cat([avgout, maxout], dim=1)
-        out = self.sigmoid(self.conv2d(out))
-        return out * x
- 
+        identity = x
+
+        # 生成多尺度上下文特征
+        ctx_features = []
+        for conv in self.dilated_convs:
+            ctx_features.append(F.gelu(conv(x)))
+        ctx_features = torch.stack(ctx_features, dim=1)  # [B,4,C,H,W]
+
+        # 动态融合（修正权重维度）
+        fusion_weights = F.softmax(self.fusion_weights, 0).view(1, -1, 1, 1, 1)
+        fused_ctx = torch.sum(ctx_features * fusion_weights, dim=1)  # [B,C,H,W]
+
+        # 锐化模块
+        sharp_feat = self.h_ctx(x)
+        sharp_feat = sharp_feat + F.hardtanh(sharp_feat - x.mean(dim=1, keepdim=True))
+
+        # 特征融合（保持通道维度一致）
+        fused = torch.cat([fused_ctx, sharp_feat], dim=1)
+
+        # 动态投影 + 残差连接
+        out = self.dynamic_proj(fused) + self.shortcut(identity)
+        return F.gelu(out)
+
+
+class DepthWiseSeparableConv(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size):
+        super().__init__()
+        self.depthwise = nn.Conv2d(in_ch, in_ch, kernel_size,
+                                   padding=kernel_size // 2, groups=in_ch)
+        self.pointwise = nn.Conv2d(in_ch, out_ch, 1)
+
+    def forward(self, x):
+        return self.pointwise(self.depthwise(x))
+
 class DLK_2D(nn.Module):
     def __init__(self, dim):
         super().__init__()
-      
+        # 将 3D 卷积替换为 2D 卷积
         self.att_conv1 = nn.Conv2d(dim, dim, kernel_size=5, stride=1, padding=2, groups=dim)
         self.att_conv2 = nn.Conv2d(dim, dim, kernel_size=7, stride=1, padding=9, groups=dim, dilation=3)
+        #
 
-       
+        # self.att_conv2 = nn.Conv2d(dim, dim, kernel_size=7, stride=1, padding=3, groups=dim)
+
+        # 将 3D 卷积替换为 2D 卷积
         self.spatial_se = nn.Sequential(
             nn.Conv2d(in_channels=2, out_channels=2, kernel_size=7, padding=3),
             nn.Sigmoid()
@@ -178,9 +176,9 @@ class DLK_2D(nn.Module):
         att2 = self.att_conv2(att1)
 
         att = torch.cat([att1, att2], dim=1)
-       
+        # 调整为 2D 维度的平均池化
         avg_att = torch.mean(att, dim=1, keepdim=True)
-      
+        # 调整为 2D 维度的最大池化
         max_att, _ = torch.max(att, dim=1, keepdim=True)
         att = torch.cat([avg_att, max_att], dim=1)
         att = self.spatial_se(att)
@@ -188,10 +186,7 @@ class DLK_2D(nn.Module):
         output = output + x
         return output
 
-
-
-
-class MCFS(nn.Module):
+class LKS(nn.Module):
     def __init__(self, dim,H,W, s_kernel_size=3):
         super().__init__()
 
@@ -199,217 +194,88 @@ class MCFS(nn.Module):
         self.proj_2 = nn.Conv2d(dim * 2, dim, 1, padding=0)
         self.proj_3 = nn.Conv2d(dim * 3, dim, 1, padding=0)
         self.norm_proj = LayerNorm(dim, eps=1e-6, data_format="channels_first")
-
+        
         # multiscale spatial context layers
         self.s_ctx_1 = nn.Conv2d(dim, dim, kernel_size=s_kernel_size, padding=s_kernel_size // 2, groups=dim // 4)
         self.s_ctx_2 = nn.Conv2d(dim, dim, kernel_size=s_kernel_size, dilation=2, padding=(s_kernel_size // 2) * 2,
                                  groups=dim // 4)
-        # self.s_ctx_1 = nn.Conv2d(dim, dim, kernel_size=s_kernel_size, padding=s_kernel_size // 2, groups=dim // 4)
-        # self.s_ctx_2 = nn.Conv2d(dim, dim, kernel_size=s_kernel_size, dilation=3, padding=(s_kernel_size // 2) * 3,
-        #                          groups=dim // 4)
-        # self.s_ctx_3 = nn.Conv2d(dim, dim, kernel_size=s_kernel_size, dilation=5, padding=(s_kernel_size // 2) * 5,
-        #                          groups=dim // 4)
-        # self.s_ctx_4 = nn.Conv2d(dim, dim, kernel_size=s_kernel_size, dilation=7, padding=(s_kernel_size // 2) * 7,
-        #                          groups=dim // 4)
-        # self.s_ctx_5 = nn.Conv2d(dim, dim, kernel_size=s_kernel_size, dilation=9, padding=(s_kernel_size // 2) * 9,
-        #                          groups=dim // 4)
+
 
         self.norm_s = LayerNorm(dim, eps=1e-6, data_format="channels_first")
 
         # sharpening module layers
-        # self.h_ctx = nn.Conv2d(dim, dim, kernel_size=5, padding=2, bias=False, groups=dim)
+   
         self.h_ctx = nn.Conv2d(dim, dim, kernel_size=5, padding=2, bias=False, groups=dim)
-        self.h_ctx1 = nn.Conv2d(dim, dim, kernel_size=5, padding=4, dilation=2,bias=False, groups=dim)
-     
+       
+
         self.norm_h = LayerNorm(dim, eps=1e-6, data_format="channels_first")
 
         self.act = nn.GELU()
-        self.odcon = ODConv2d(dim,dim, 3)
-        # self.edge = EdgeEnhancer(dim, norm=nn.BatchNorm2d, act=nn.ReLU)
-        # self.adp = AdaptiveDilatedConv(dim, dim, 3)
-        # self.pcov = PConv(dim, dim, k=3, s=1)
-        # 
-        #self.snake_conv = DSConv_pro(in_channels=dim, out_channels=dim, kernel_size=9,
-        #                              extend_scope=1.0, morph=0, if_offset=True)
-        # self.snake_convy = DSConv_pro(in_channels=dim, out_channels=dim, kernel_size=9,
-        #                               extend_scope=1.0, morph=1, if_offset=True)
-        # self.conv1 = EncoderConv(2 * dim, dim)
-        
-        # self.DoGSharpening = DoGSharpening(dim)
-        # self.simam = simam_module()
+
+        self.simam = simam_module()
         # self.laplace_sharpening = LaplaceSharpening(dim)
-        # self.wtconv = WTConv2d(dim,dim)
-        # self.conv_spatial = nn.Conv2d(
-        #     dim, dim, 7, stride=1, padding=9, groups=dim, dilation=3)
-        # self.conv_spatial = nn.Conv2d(
-        #     dim, dim, 7, stride=1, padding=3, groups=dim)
-        # self.sab = SAB()
-        # self.fem = FEM(dim,dim)
-        # self.lka = MLKA_Ablation(dim)
-        # self.fs = FrequencySelection(dim)
-        #self.t = TripletAttention(dim)
-        self.n =nn.Sequential(nn.Conv2d(dim, dim * 4, kernel_size=(1, 1)),
-                nn.GELU(),
-                nn.BatchNorm2d(dim * 4),
-                nn.Conv2d(dim * 4, dim, kernel_size=(1, 1)),
-                nn.GELU(),
-                nn.BatchNorm2d(dim))
-        #self.block = Block(dim)
-        #self.compress = ChannelPool()
-        #self.si = simam_module()
-        #self.cbam = CBAM(dim,dim)
-       
+        
+        self.fuse = nn.Sequential(
+            nn.Conv2d(dim * 4, dim, kernel_size=1, padding=0),
+            LayerNorm(dim, eps=1e-6, data_format="channels_first"),
+            nn.GELU()
+        )
+      
+
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.softmax = nn.Softmax(dim=2)
+        self.softmax_1 = nn.Sigmoid()
+
+
         self.dlk = DLK_2D(dim)
+     
+
+        # 全局平均池化+1*1卷积核+ReLu+1*1卷积核+Sigmoid
+
+       
+        
         
         
     def forward(self, x):
-      
+
+
         x = self.norm_proj(self.act(self.proj_1(x)))
-        
         B, C, H, W = x.shape
 
-        # extract multi-scale contextual features
 
-
-        
-        
-        #sx1 = self.act(self.s_ctx_1(x))
-        #sx1 = self.act(self.s_ctx_1(x))
-
-
-
-        #sx2 = self.act(self.s_ctx_2(x))
-        
-       
-
-        #sx = self.norm_s( sx1 + sx2)
         sx = self.dlk(x)
-        
-       
-        
-        
-       
+
+
+
 
         
-       
-        # feature enhancement using learnable sharpening factors
-        # implementation of sharpening module
-       
-      
+        
         hx = self.act(self.h_ctx(x))
-       
-       
+
+      
+
+
+
+      
         
-
         
-
-         
-
-        # hx = self.act(self.conv_spatial(x))
-
-        # hx_t = x - hx.mean(dim=1).unsqueeze(1)
-
         
-        # hx_t = self.sab(hx_t) * hx_t
-        
-       
-     
         hx_t = x - hx.mean(dim=1).unsqueeze(1)
+        
         hx_t = torch.softmax(hx.mean(dim=[-2, -1]).unsqueeze(-1).unsqueeze(-1), dim=1) * hx_t
 
         hx = self.norm_h(hx + hx_t)
         
-        
 
         # combine the multiscale contetxual features with the sharpened features
         x = self.act(self.proj_2(torch.cat([sx, hx], dim=1)))
-       
         
-
+        
+        
         return x
 
 
-class FSB(nn.Module):
-    """
-    Feature Sharpening Block:
-    It is the core block of the COSNet encoder/backbone,
-    utilized to extract semantically rich features for segementation task in cluttered background.
-    -----------------------------------------------
-    dim:           Input channel dimension
-    s_kernel_size: Kernel size for spatial context layers
-    expan_ratio:   Expansion ratio used for channels in MLP
-    ------------------------------------------------
-
-    """
-
-    def __init__(self, dim, s_kernel_size=3, drop_path=0.1, layer_scale_init_value=1e-6, expan_ratio=4):
-        super().__init__()
-
-        self.conv_dw = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
-        self.norm_dw = LayerNorm(dim, eps=1e-6, data_format="channels_first")
-
-        self.layer_norm_1 = LayerNorm(dim, eps=1e-6, data_format="channels_first")
-        self.layer_norm_2 = LayerNorm(dim, eps=1e-6, data_format="channels_first")
-
-        self.mlp = MLP(dim=dim, mlp_ratio=expan_ratio)
-        self.attn = MCFS(dim, s_kernel_size=s_kernel_size)
-
-        self.drop_path_1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.drop_path_2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-
-        x = x + self.norm_dw(self.act(self.conv_dw(x)))
-
-        x_copy = x
-        x = self.layer_norm_1(x_copy)
-        x = self.drop_path_1(self.attn(x))
-        out = x + x_copy
-
-        x = self.layer_norm_2(out)
-        x = self.drop_path_2(self.mlp(x))
-        out = out + x
-
-        return out
 
 
-class MLP(nn.Module):
-    def __init__(self, dim, mlp_ratio=4):
-        super().__init__()
-
-        self.fc_1 = nn.Conv2d(dim, dim * mlp_ratio, 1)
-        self.pos = nn.Conv2d(dim * mlp_ratio, dim * mlp_ratio, 3, padding=1, groups=dim * mlp_ratio)
-        self.fc_2 = nn.Conv2d(dim * mlp_ratio, dim, 1)
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-
-        x = self.fc_1(x)
-        x = self.act(x)
-        x = x + self.act(self.pos(x))
-        x = self.fc_2(x)
-
-        return x
 
 
-class BEM(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = nn.Conv2d(dim * 2, dim, kernel_size=3, stride=1, padding=1)
-        self.norm = LayerNorm(dim, eps=1e-6, data_format="channels_first")
-        self.act = nn.GELU()
-        self.pool = nn.MaxPool2d(kernel_size=4, stride=4)
-
-    def forward(self, x):
-        dx = self.pool(x)
-        ex = torch.nn.functional.interpolate(dx, size=x.shape[2:], mode='bilinear') - x
-        x = torch.cat([ex, x], dim=1)
-        x = self.conv(x)
-        x = self.act(x)
-        x = self.norm(x)
-
-        return x
